@@ -1088,13 +1088,4 @@ C_RULES = [
 {"id":"C013","pattern":r"\bscanf\s*\s*\"[^\"]*\"\s*,\s*\w+\s*","error":"Possible scanf address error","reason":"scanf usually requires an address for ordinary variables.","fix":"Use &variable for int, float, etc., where appropriate.","severity":"Warning"},
 
 # 14
-{"id":"C014","pattern":r"\bscanf\s*[^&]*,\s*\w+\s*","error":"Possible missing & in scanf","reason":"scanf generally needs the address of the variable.","fix":"Use &variable for scalar input."},
-
-
-{
-    "id": "C015",
-    "pattern": r'\bprintf\s*\(\s*"[^"]*"\s*\)',
-    "message": "printf() statement detected",
-    "reason": "This is a normal printf statement.",
-    "fix": "Check the format string and arguments."
-},
+{"id":"C014","pattern":r"\bscanf\s*[^&]*,\s*\w+\s*","error":"Possible missing & in scanf","reason":"scanf generally needs the address of the variable.","fix":"Use &variable for scalar input."}
