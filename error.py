@@ -1,9 +1,14 @@
+
 from flask import Flask, request, jsonify, send_file
 import ast
 import re
 
 app = Flask(__name__)
 
+
+# ============================================================
+# FRONTEND
+# ============================================================
 
 @app.route("/")
 def home():
@@ -20,42 +25,52 @@ def js():
     return send_file("error.js")
 
 
-# =========================================================
-# COMMON RESPONSE
-# =========================================================
+# ============================================================
+# COMMON RESULT
+# ============================================================
 
-def error_result(language, error, reason, fix, line=None, severity="Error"):
+def result(language, error, reason, fix, line,
+           severity="Error", rule=None):
+
     return {
         "status": "error",
         "language": language,
         "severity": severity,
         "line": line,
+        "rule": rule,
         "error": error,
         "reason": reason,
         "fix": fix
     }
 
 
-def success_result(language):
+def success(language):
     return {
         "status": "success",
         "language": language,
-        "severity": "Info",
-        "line": None,
-        "error": "No Known Error Found",
-        "reason": "No known error pattern was detected.",
-        "fix": "Try another test case or use AI analysis."
+        "errors": [],
+        "message": "No known error detected."
     }
 
 
-def check_patterns(code, language, patterns):
+def line_number(code, position):
+    return code[:position].count("\n") + 1
 
-    for pattern, error, reason, fix, *extra in patterns:
 
-        severity = extra[0] if extra else "Error"
+def regex_scan(code, language, rules):
+    """
+    Detect multiple errors instead of stopping
+    after the first error.
+    """
+
+    found = []
+
+    for rule in rules:
+
+        pattern = rule["pattern"]
 
         try:
-            match = re.search(
+            matches = re.finditer(
                 pattern,
                 code,
                 re.IGNORECASE | re.MULTILINE
@@ -63,1723 +78,1017 @@ def check_patterns(code, language, patterns):
         except re.error:
             continue
 
-        if match:
+        for match in matches:
 
-            line = code[:match.start()].count("\n") + 1
+            line = line_number(code, match.start())
 
-            return error_result(
-                language,
-                error,
-                reason,
-                fix,
-                line,
-                severity
+            found.append(
+                result(
+                    language,
+                    rule["error"],
+                    rule["reason"],
+                    rule["fix"],
+                    line,
+                    rule.get("severity", "Error"),
+                    rule.get("id")
+                )
             )
 
-    return None
+    return found
 
 
-# =========================================================
-# PYTHON - 50+ RULES
-# =========================================================
+def remove_duplicates(errors):
 
-PYTHON_PATTERNS = [
+    unique = []
+    seen = set()
 
-    (
-        r"\bprint\s+['\"]",
-        "Python 2 Print Syntax",
-        "Old Python print syntax detected.",
-        "Use print(...) instead."
-    ),
+    for error in errors:
 
-    (
-        r"\bprintff\s*\(",
-        "Typo Error",
-        "printff is not a Python function.",
-        "Use print()."
-    ),
+        key = (
+            error["language"],
+            error["line"],
+            error["error"]
+        )
 
-    (
-        r"\bdef\s+\w+\s*\([^)]*\)\s*(?!:)",
-        "Missing Colon",
-        "Function definition requires ':'.",
-        "Add ':' after the function definition."
-    ),
+        if key not in seen:
+            seen.add(key)
+            unique.append(error)
 
-    (
-        r"(?m)^\s*(if|elif|else|for|while|try|except|finally|class|with)\b[^:\n]*$",
-        "Missing Colon",
-        "Python block appears to be missing ':'.",
-        "Add ':' at the end."
-    ),
+    unique.sort(key=lambda x: (
+        x["line"] if x["line"] else 0
+    ))
 
-    (
-        r"\bTrue\s*=",
-        "Invalid Assignment",
-        "True is a Python constant.",
-        "Do not assign a value to True."
-    ),
+    return unique
 
-    (
-        r"\bFalse\s*=",
-        "Invalid Assignment",
-        "False is a Python constant.",
-        "Do not assign a value to False."
-    ),
 
-    (
-        r"\bNone\s*=",
-        "Invalid Assignment",
-        "None is a Python constant.",
-        "Do not assign a value to None."
-    ),
+# ============================================================
+# PYTHON
+# ============================================================
 
-    (
-        r"\bfor\s+\w+\s+in\s*$",
-        "Incomplete For Loop",
-        "The for loop has no iterable.",
-        "Provide an iterable after 'in'."
-    ),
+PYTHON_RULES = [
 
-    (
-        r"\bwhile\s*:\s*$",
-        "Incomplete While Loop",
-        "while requires a condition.",
-        "Add a Boolean condition."
-    ),
+# 01
+{
+"id": "PY001",
+"pattern": r"\bprintff\s*",
+"error": "Unknown function printff()",
+"reason": "printff() is not a standard Python function.",
+"fix": "Use print()."
+},
 
-    (
-        r"\bif\s*:\s*$",
-        "Incomplete If Statement",
-        "if requires a condition.",
-        "Add a condition."
-    ),
+# 02
+{
+"id": "PY002",
+"pattern": r"\bprin\s*\(",
+"error": "Possible typo in print()",
+"reason": "prin() is not the standard Python output function.",
+"fix": "Use print()."
+},
 
-    (
-        r"\belse\s+\w",
-        "Invalid Else Syntax",
-        "else cannot have a normal condition.",
-        "Use elif for another condition."
-    ),
+# 03
+{
+"id": "PY003",
+"pattern": r"\bif\s+[^:\n]+$",
+"error": "Missing colon after if",
+"reason": "Python if statements require a colon.",
+"fix": "Add : at the end of the if condition."
+},
 
-    (
-        r"\bimport\s*$",
-        "Incomplete Import",
-        "No module was specified.",
-        "Specify a module."
-    ),
+# 04
+{
+"id": "PY004",
+"pattern": r"\belse\s*$",
+"error": "Missing colon after else",
+"reason": "Python else statements require a colon.",
+"fix": "Write else:."
+},
 
-    (
-        r"\bfrom\s+\w+\s+import\s*$",
-        "Incomplete Import",
-        "import statement is incomplete.",
-        "Specify the object to import."
-    ),
+# 05
+{
+"id": "PY005",
+"pattern": r"\belif\s+[^:\n]+$",
+"error": "Missing colon after elif",
+"reason": "elif requires a colon.",
+"fix": "Add : after the elif condition."
+},
 
-    (
-        r"\bopen\s*\([^)]*$",
-        "Unclosed Function Call",
-        "open() is not closed.",
-        "Add ')'."
-    ),
+# 06
+{
+"id": "PY006",
+"pattern": r"\bfor\s+[^:\n]+$",
+"error": "Missing colon after for",
+"reason": "Python for loops require a colon.",
+"fix": "Add : at the end of the for statement."
+},
 
-    (
-        r"\bprint\s*\([^)]*$",
-        "Unclosed Print Call",
-        "print() is not closed.",
-        "Add ')'."
-    ),
+# 07
+{
+"id": "PY007",
+"pattern": r"\bwhile\s+[^:\n]+$",
+"error": "Missing colon after while",
+"reason": "Python while loops require a colon.",
+"fix": "Add :."
+},
 
-    (
-        r"\binput\s*\([^)]*$",
-        "Unclosed Input Call",
-        "input() is not closed.",
-        "Add ')'."
-    ),
+# 08
+{
+"id": "PY008",
+"pattern": r"\bdef\s+\w+\s*\([^)]*\s*$",
+"error": "Missing colon after function definition",
+"reason": "Function definitions require a colon.",
+"fix": "Add : after the function declaration."
+},
 
-    (
-        r"\blen\s*\([^)]*$",
-        "Unclosed len Call",
-        "len() is not closed.",
-        "Add ')'."
-    ),
+# 09
+{
+"id": "PY009",
+"pattern": r"\bclass\s+\w+\s*$",
+"error": "Missing colon after class",
+"reason": "Class definitions require a colon.",
+"fix": "Add : after the class declaration."
+},
 
-    (
-        r"\brange\s*\([^)]*$",
-        "Unclosed range Call",
-        "range() is not closed.",
-        "Add ')'."
-    ),
+# 10
+{
+"id": "PY010",
+"pattern": r"\btry\s*$",
+"error": "Missing colon after try",
+"reason": "try requires a colon.",
+"fix": "Use try:."
+},
 
-    (
-        r"\bint\s*\([^)]*$",
-        "Unclosed int Call",
-        "int() is not closed.",
-        "Add ')'."
-    ),
+# 11
+{
+"id": "PY011",
+"pattern": r"\bexcept(?:\s+[^:]*)?$",
+"error": "Missing colon after except",
+"reason": "except requires a colon.",
+"fix": "Add : after except."
+},
 
-    (
-        r"\bstr\s*\([^)]*$",
-        "Unclosed str Call",
-        "str() is not closed.",
-        "Add ')'."
-    ),
+# 12
+{
+"id": "PY012",
+"pattern": r"\bfinally\s*$",
+"error": "Missing colon after finally",
+"reason": "finally requires a colon.",
+"fix": "Use finally:."
+},
 
-    (
-        r"\b\d+\s*/\s*0\b",
-        "Division by Zero",
-        "The code divides by zero.",
-        "Check the denominator."
-    ),
+# 13
+{
+"id": "PY013",
+"pattern": r"\bwith\s+[^:\n]+$",
+"error": "Missing colon after with",
+"reason": "with statements require a colon.",
+"fix": "Add :."
+},
 
-    (
-        r"\b0\s*/\s*0\b",
-        "Division by Zero",
-        "The code divides zero by zero.",
-        "Use a non-zero denominator."
-    ),
+# 14
+{
+"id": "PY014",
+"pattern": r"\bimport\s+[A-Za-z_]\w*\s+from\b",
+"error": "Invalid import syntax",
+"reason": "import and from are used differently.",
+"fix": "Use from module import name."
+},
 
-    (
-        r"\[[^\]]*\]\s*\[\s*['\"]",
-        "Invalid List Index",
-        "A string key is being used on a list.",
-        "Use an integer index."
-    ),
+# 15
+{
+"id": "PY015",
+"pattern": r"\bfrom\s+\w+\s+import\s*$",
+"error": "Missing imported name",
+"reason": "from ... import requires a name.",
+"fix": "Specify what should be imported."
+},
 
-    (
-        r"\.append\s*\([^)]*\)\s*\[",
-        "Append Result Misuse",
-        "append() returns None.",
-        "Append first, then access the list."
-    ),
+# 16
+{
+"id": "PY016",
+"pattern": r"\bprint\s+[^(]",
+"error": "Possible Python 2 print syntax",
+"reason": "Python 3 uses print() as a function.",
+"fix": "Use print(value)."
+},
 
-    (
-        r"\.sort\s*\([^)]*\)\s*\[",
-        "Sort Result Misuse",
-        "sort() modifies the list and returns None.",
-        "Sort first, then access the list."
-    ),
+# 17
+{
+"id": "PY017",
+"pattern": r"\bTrue\s*=\s*",
+"error": "Cannot assign to True",
+"reason": "True is a Python constant.",
+"fix": "Use another variable name."
+},
 
-    (
-        r"\.reverse\s*\([^)]*\)\s*\[",
-        "Reverse Result Misuse",
-        "reverse() modifies the list and returns None.",
-        "Reverse first, then access the list."
-    ),
+# 18
+{
+"id": "PY018",
+"pattern": r"\bFalse\s*=\s*",
+"error": "Cannot assign to False",
+"reason": "False is a Python constant.",
+"fix": "Use another variable name."
+},
 
-    (
-        r"\beval\s*\(",
-        "Dangerous eval Usage",
-        "eval() executes dynamically supplied Python code.",
-        "Avoid eval() for untrusted input.",
-        "Warning"
-    ),
+# 19
+{
+"id": "PY019",
+"pattern": r"\bNone\s*=\s*",
+"error": "Cannot assign to None",
+"reason": "None is a Python constant.",
+"fix": "Use another variable name."
+},
 
-    (
-        r"\bexec\s*\(",
-        "Dangerous exec Usage",
-        "exec() executes dynamically supplied Python code.",
-        "Avoid exec() for untrusted input.",
-        "Warning"
-    ),
+# 20
+{
+"id": "PY020",
+"pattern": r"\bif\s+.*[^=!<>]=[^=].*:",
+"error": "Assignment used in condition",
+"reason": "Python conditions normally use == for comparison.",
+"fix": "Use == instead of =."
+},
 
-    (
-        r"\binput\s*\(.*\)\s*==\s*\d",
-        "Input Type Error",
-        "input() returns a string in Python 3.",
-        "Convert input using int() or float()."
-    ),
+# 21
+{
+"id": "PY021",
+"pattern": r"\bfor\s+\w+\s+in\s+range\s*\s*\d+\s*,\s*\d+\s*\s*$",
+"error": "Possible incomplete for loop",
+"reason": "The loop appears to have no body.",
+"fix": "Add an indented loop body."
+},
 
-    (
-        r"\b\d+\s*\+\s*['\"]",
-        "Type Error",
-        "Number and string are being added.",
-        "Convert them to compatible types."
-    ),
+# 22
+{
+"id": "PY022",
+"pattern": r"\bwhile\s+True\s*:",
+"error": "Potential infinite loop",
+"reason": "while True continues until break or exception.",
+"fix": "Ensure a valid break condition exists.",
+"severity": "Warning"
+},
 
-    (
-        r"['\"][^'\"]*['\"]\s*-\s*\w+",
-        "Type Error",
-        "String is being used in subtraction.",
-        "Convert the value to a number."
-    ),
+# 23
+{
+"id": "PY023",
+"pattern": r"\bopen\s*[^)]*",
+"error": "Check file handling",
+"reason": "Files should normally be closed after use.",
+"fix": "Prefer using with open(...) as file:.",
+"severity": "Warning"
+},
 
-    (
-        r"(?m)^\s*global\s*$",
-        "Incomplete Global Statement",
-        "global requires a variable name.",
-        "Specify the variable."
-    ),
+# 24
+{
+"id": "PY024",
+"pattern": r"\b\d+\s*/\s*0\b",
+"error": "Division by zero",
+"reason": "Division by zero raises an exception.",
+"fix": "Check the denominator before division."
+},
 
-    (
-        r"(?m)^\s*nonlocal\s*$",
-        "Incomplete Nonlocal Statement",
-        "nonlocal requires a variable.",
-        "Specify the variable."
-    ),
+# 25
+{
+"id": "PY025",
+"pattern": r"\bint\s*\s*input\s*\([^)]*\s*\)",
+"error": "Check user input conversion",
+"reason": "Invalid numeric input can raise ValueError.",
+"fix": "Validate input or handle ValueError.",
+"severity": "Warning"
+},
 
-    (
-        r"(?m)^\s*assert\s*$",
-        "Incomplete Assert",
-        "assert requires an expression.",
-        "Provide a condition."
-    ),
+# 26
+{
+"id": "PY026",
+"pattern": r"\bfloat\s*\s*input\s*\([^)]*\s*\)",
+"error": "Check float input conversion",
+"reason": "Non-numeric input can raise ValueError.",
+"fix": "Validate input or use try-except.",
+"severity": "Warning"
+},
 
-    (
-        r"(?m)^\s*raise\s*$",
-        "Incomplete Raise",
-        "raise requires an exception.",
-        "Raise a specific exception."
-    ),
+# 27
+{
+"id": "PY027",
+"pattern": r"\blist\s*[^]+\]",
+"error": "Check list index",
+"reason": "Invalid indexes can raise IndexError.",
+"fix": "Ensure the index is within the list length.",
+"severity": "Warning"
+},
 
-    (
-        r"\basync\s+def\s+\w+\s*\([^)]*\)\s*(?!:)",
-        "Async Function Error",
-        "async def requires ':'.",
-        "Add ':'."
-    ),
+# 28
+{
+"id": "PY028",
+"pattern": r"\.append\s*[^)]*\s*\.",
+"error": "Invalid append chaining",
+"reason": "append() returns None.",
+"fix": "Do not chain methods after append()."
+},
 
-    (
-        r"\bawait\s*$",
-        "Invalid Await",
-        "await requires an expression.",
-        "Await an async operation."
-    ),
+# 29
+{
+"id": "PY029",
+"pattern": r"\.sort\s*\s*\s*\.",
+"error": "Invalid sort chaining",
+"reason": "list.sort() modifies the list and returns None.",
+"fix": "Call sort() separately."
+},
 
-    (
-        r"\bwith\s+open\s*\([^)]*\)\s+as\s*$",
-        "Incomplete With Statement",
-        "with ... as requires a variable.",
-        "Add a variable and ':'."
-    ),
+# 30
+{
+"id": "PY030",
+"pattern": r"\bprint\s*[^)]*\s*\+\s*",
+"error": "Invalid print expression",
+"reason": "Check the expression being concatenated with print().",
+"fix": "Build the expression before passing it to print().",
+"severity": "Warning"
+},
 
-    (
-        r"\b(lambda)\s+\w+\s*:\s*$",
-        "Incomplete Lambda",
-        "Lambda has no expression.",
-        "Provide an expression."
-    ),
+# 31
+{
+"id": "PY031",
+"pattern": r"\bdef\s+\w+\s*[^)]*\s*:",
+"error": "Check function parameters",
+"reason": "Verify that arguments passed to this function match its parameters.",
+"fix": "Check function definition and function calls.",
+"severity": "Info"
+},
 
-    (
-        r"\bimport\s+\w+\s+as\s*$",
-        "Incomplete Import Alias",
-        "Import alias is incomplete.",
-        "Provide an alias."
-    ),
+# 32
+{
+"id": "PY032",
+"pattern": r"\breturn\s+",
+"error": "Check return path",
+"reason": "Functions should return appropriate values on required paths.",
+"fix": "Verify the function's return value.",
+"severity": "Warning"
+},
 
-    (
-        r"\b\d+\s*//\s*0\b",
-        "Floor Division By Zero",
-        "Floor division by zero is invalid.",
-        "Use a non-zero denominator."
-    ),
+# 33
+{
+"id": "PY033",
+"pattern": r"\bexcept\s*:",
+"error": "Broad exception handler",
+"reason": "Catching every exception can hide programming errors.",
+"fix": "Catch the specific exception you expect.",
+"severity": "Warning"
+},
 
-    (
-        r"\b\d+\s*%\s*0\b",
-        "Modulo By Zero",
-        "Modulo by zero is invalid.",
-        "Use a non-zero divisor."
-    ),
+# 34
+{
+"id": "PY034",
+"pattern": r"\bexcept\s+Exception\s*:",
+"error": "Broad Exception handler",
+"reason": "Exception catches many unrelated errors.",
+"fix": "Catch a more specific exception.",
+"severity": "Warning"
+},
 
-    (
-        r"\bdel\s+\w+\s*$",
-        "Possible Deleted Variable",
-        "Variable is deleted and may be used later.",
-        "Check variable usage after del.",
-        "Warning"
-    ),
+# 35
+{
+"id": "PY035",
+"pattern": r"\bglobal\s+\w+",
+"error": "Global variable usage",
+"reason": "Global state can make code harder to maintain.",
+"fix": "Prefer function parameters or return values.",
+"severity": "Warning"
+},
 
-    (
-        r"\bexcept\s*:\s*$",
-        "Bare Except",
-        "Bare except catches every exception.",
-        "Catch a specific exception.",
-        "Warning"
-    ),
+# 36
+{
+"id": "PY036",
+"pattern": r"\bexec\s*",
+"error": "Use of exec()",
+"reason": "exec() dynamically executes code.",
+"fix": "Avoid exec() unless it is genuinely required.",
+"severity": "Warning"
+},
 
-    (
-        r"\bfinally\s+except\b",
-        "Invalid Exception Structure",
-        "finally cannot be followed by except.",
-        "Use except before finally."
-    ),
+# 37
+{
+"id": "PY037",
+"pattern": r"\beval\s*\(",
+"error": "Use of eval()",
+"reason": "eval() dynamically evaluates code.",
+"fix": "Avoid eval() and parse input safely.",
+"severity": "Warning"
+},
 
-    (
-        r"\belse\s+elif\b",
-        "Invalid Conditional Structure",
-        "elif must come before else.",
-        "Reorder elif and else."
-    ),
+# 38
+{
+"id": "PY038",
+"pattern": r"\bos\.system\s*\(",
+"error": "System command execution",
+"reason": "os.system() executes an operating-system command.",
+"fix": "Use safer APIs and validate inputs.",
+"severity": "Warning"
+},
 
-    (
-        r"\breturn\s+\w+\s+\w+",
-        "Possible Invalid Return",
-        "Return statement may contain an invalid expression.",
-        "Check the returned expression.",
-        "Warning"
-    ),
+# 39
+{
+"id": "PY039",
+"pattern": r"\bopen\s*\([^,]+,\s*[\"']w[\"']\s*",
+"error": "File opened in write mode",
+"reason": "Write mode can replace existing file contents.",
+"fix": "Use append mode or another mode if replacement is not intended.",
+"severity": "Warning"
+},
 
-    (
-        r"\btuple\s*\([^)]*$",
-        "Unclosed tuple Call",
-        "tuple() call is not closed.",
-        "Add ')'."
-    ),
+# 40
+{
+"id": "PY040",
+"pattern": r"\b\d+\s*\s*\d+\s*",
+"error": "Invalid numeric indexing",
+"reason": "Integer values cannot normally be indexed.",
+"fix": "Index a sequence such as a list or string.",
+"severity": "Error"
+},
 
-    (
-        r"\bdict\s*\([^)]*$",
-        "Unclosed dict Call",
-        "dict() call is not closed.",
-        "Add ')'."
-    ),
+# 41
+{
+"id": "PY041",
+"pattern": r"\b[a-zA-Z_]\w*\s*\.\s*length\b",
+"error": "Possible incorrect length property",
+"reason": "Python sequences normally use len().",
+"fix": "Use len(variable)."
+},
 
-    (
-        r"\blist\s*\([^)]*$",
-        "Unclosed list Call",
-        "list() call is not closed.",
-        "Add ')'."
-    ),
+# 42
+{
+"id": "PY042",
+"pattern": r"\b[a-zA-Z_]\w*\.length\s*",
+"error": "Invalid length() method",
+"reason": "Python uses len() instead of length().",
+"fix": "Use len(variable)."
+},
 
-    (
-        r"\bfloat\s*\([^)]*$",
-        "Unclosed float Call",
-        "float() call is not closed.",
-        "Add ')'."
-    ),
+# 43
+{
+"id": "PY043",
+"pattern": r"\bnull\b",
+"error": "Invalid null keyword",
+"reason": "Python uses None instead of null.",
+"fix": "Replace null with None."
+},
 
-    (
-        r"\bbool\s*\([^)]*$",
-        "Unclosed bool Call",
-        "bool() call is not closed.",
-        "Add ')'."
-    ),
+# 44
+{
+"id": "PY044",
+"pattern": r"\btrue\b",
+"error": "Invalid boolean literal",
+"reason": "Python boolean literal is True.",
+"fix": "Use True."
+},
 
-    (
-        r"\bbytes\s*\([^)]*$",
-        "Unclosed bytes Call",
-        "bytes() call is not closed.",
-        "Add ')'."
-    ),
+# 45
+{
+"id": "PY045",
+"pattern": r"\bfalse\b",
+"error": "Invalid boolean literal",
+"reason": "Python boolean literal is False.",
+"fix": "Use False."
+},
 
-    (
-        r"\bopen\s*\(\s*['\"][^'\"]+['\"]\s*,\s*['\"]invalid['\"]",
-        "Invalid File Mode",
-        "Invalid file mode detected.",
-        "Use modes such as r, w, a, rb or wb."
-    )
+# 46
+{
+"id": "PY046",
+"pattern": r"//",
+"error": "Possible invalid comment syntax",
+"reason": "Python normally uses # for comments.",
+"fix": "Use # for a Python comment.",
+"severity": "Warning"
+},
+
+# 47
+{
+"id": "PY047",
+"pattern": r"\+\+",
+"error": "Invalid ++ operator",
+"reason": "Python does not support the C/Java ++ operator.",
+"fix": "Use variable += 1."
+},
+
+# 48
+{
+"id": "PY048",
+"pattern": r"--",
+"error": "Invalid -- operator",
+"reason": "Python does not support the C/Java -- operator.",
+"fix": "Use variable -= 1."
+},
+
+# 49
+{
+"id": "PY049",
+"pattern": r"\bnew\s+\w+",
+"error": "Invalid new keyword",
+"reason": "Python does not use new for normal object creation.",
+"fix": "Create the object using ClassName()."
+},
+
+# 50
+{
+"id": "PY050",
+"pattern": r"\bSystem\.out\.println",
+"error": "Java syntax inside Python",
+"reason": "System.out.println() is Java syntax.",
+"fix": "Use print() in Python."
+},
+
+# 51
+{
+"id": "PY051",
+"pattern": r"\bpublic\s+class\b",
+"error": "Java class syntax detected",
+"reason": "public class is Java syntax.",
+"fix": "Use Python class syntax: class ClassName:."
+},
+
+# 52
+{
+"id": "PY052",
+"pattern": r"\bString\s+\w+",
+"error": "Java type declaration detected",
+"reason": "Python does not require String type declarations.",
+"fix": "Use variable = value."
+},
+
+# 53
+{
+"id": "PY053",
+"pattern": r"\bint\s+\w+\s*=",
+"error": "C/Java style declaration",
+"reason": "Python does not use int before variable assignment.",
+"fix": "Use variable = value."
+},
+
+# 54
+{
+"id": "PY054",
+"pattern": r"\bnew\s+\w+\s*\(",
+"error": "Java/C++ style object creation",
+"reason": "Python does not use new.",
+"fix": "Use ClassName()."
+},
+
+# 55
+{
+"id": "PY055",
+"pattern": r"\bcatch\s*\(",
+"error": "Invalid catch syntax",
+"reason": "Python uses except instead of catch.",
+"fix": "Use try: ... except:."
+},
+
+# 56
+{
+"id": "PY056",
+"pattern": r"\bthrows\b",
+"error": "Invalid throws keyword",
+"reason": "Python does not use Java's throws declaration.",
+"fix": "Handle exceptions using try-except."
+},
+
+# 57
+{
+"id": "PY057",
+"pattern": r"\bSystem\.out",
+"error": "Java output syntax",
+"reason": "System.out is Java syntax.",
+"fix": "Use print()."
+},
+
+# 58
+{
+"id": "PY058",
+"pattern": r"\b&&\b",
+"error": "Invalid logical operator",
+"reason": "Python uses and instead of &&.",
+"fix": "Replace && with and."
+},
+
+# 59
+{
+"id": "PY059",
+"pattern": r"\|\|",
+"error": "Invalid logical operator",
+"reason": "Python uses or instead of ||.",
+"fix": "Replace || with or."
+},
+
+# 60
+{
+"id": "PY060",
+"pattern": r"!\s*(?!=)",
+"error": "Invalid logical NOT syntax",
+"reason": "Python uses not instead of !.",
+"fix": "Replace ! with not."
+}
+
 ]
 
 
 def analyze_python(code):
 
+    errors = regex_scan(code, "Python", PYTHON_RULES)
+
+    # Real Python parser
     try:
-        tree = ast.parse(code)
+        ast.parse(code)
 
     except SyntaxError as e:
 
-        return error_result(
-            "python",
-            "SyntaxError",
-            e.msg,
-            "Fix the syntax near this line.",
-            e.lineno
+        errors.append(
+            result(
+                "Python",
+                "Python SyntaxError",
+                e.msg,
+                "Fix the syntax near the reported line.",
+                e.lineno,
+                "Error",
+                "PY-AST"
+            )
         )
 
-    for node in ast.walk(tree):
+    # AST checks
+    try:
 
-        if isinstance(node, ast.BinOp):
+        tree = ast.parse(code)
 
-            if isinstance(
-                node.op,
-                (ast.Div, ast.FloorDiv, ast.Mod)
-            ):
+        for node in ast.walk(tree):
 
-                if (
-                    isinstance(node.right, ast.Constant)
-                    and node.right.value == 0
-                ):
+            # Division by zero
+            if isinstance(node, ast.BinOp):
 
-                    return error_result(
-                        "python",
-                        "Division By Zero",
-                        "The expression divides by zero.",
-                        "Use a non-zero denominator.",
-                        node.lineno
+                if isinstance(node.op, (
+                    ast.Div,
+                    ast.FloorDiv,
+                    ast.Mod
+                )):
+
+                    if isinstance(node.right, ast.Constant):
+                        if node.right.value == 0:
+
+                            errors.append(
+                                result(
+                                    "Python",
+                                    "Division by zero",
+                                    "The expression divides by zero.",
+                                    "Check the denominator before division.",
+                                    node.lineno,
+                                    "Error",
+                                    "PY-AST-DIV0"
+                                )
+                            )
+
+            # Bare except
+            if isinstance(node, ast.ExceptHandler):
+
+                if node.type is None:
+
+                    errors.append(
+                        result(
+                            "Python",
+                            "Bare except block",
+                            "This catches every exception.",
+                            "Catch a specific exception type.",
+                            node.lineno,
+                            "Warning",
+                            "PY-AST-EXCEPT"
+                        )
                     )
 
-    found = check_patterns(
-        code,
-        "python",
-        PYTHON_PATTERNS
-    )
+    except Exception:
+        pass
 
-    return found or success_result("python")
+    return remove_duplicates(errors)
 
 
-# =========================================================
-# JAVA - 50+ RULES
-# =========================================================
+# ============================================================
+# JAVA
+# ============================================================
 
-JAVA_PATTERNS = [
+JAVA_RULES = [
 
-    (
-        r"\bprintff\s*\(",
-        "Typo Error",
-        "printff is not a Java output method.",
-        "Use System.out.printf()."
-    ),
+# 01
+{"id":"JAVA001","pattern":r"\bprintff\s*\(","error":"Invalid printff()","reason":"printff() is not a standard Java method.","fix":"Use System.out.printf()."},
 
-    (
-        r"\bprintf\s*\(",
-        "Invalid printf Usage",
-        "Java printf is accessed through System.out.",
-        "Use System.out.printf()."
-    ),
+# 02
+{"id":"JAVA002","pattern":r"\bSystem\.out\.prntln\s*\(","error":"Typo in println()","reason":"prntln() does not exist.","fix":"Use System.out.println()."},
 
-    (
-        r"System\.out\.println\s*\([^;]*\)\s*$",
-        "Missing Semicolon",
-        "Java statement is missing ';'.",
-        "Add ';'."
-    ),
+# 03
+{"id":"JAVA003","pattern":r"\bSystem\.out\.pritnln\s*\(","error":"Typo in println()","reason":"pritnln() does not exist.","fix":"Use System.out.println()."},
 
-    (
-        r"System\.out\.print\s*\([^;]*\)\s*$",
-        "Missing Semicolon",
-        "Java statement is missing ';'.",
-        "Add ';'."
-    ),
+# 04
+{"id":"JAVA004","pattern":r"\bSystem\.out\.println\s*\([^;\n]*\s*$","error":"Possible missing semicolon","reason":"Java statements normally end with ;.","fix":"Add ; after println()."},
 
-    (
-        r"\bint\s+\w+\s*=\s*['\"]",
-        "Type Mismatch",
-        "String value assigned to int.",
-        "Use an integer value."
-    ),
+# 05
+{"id":"JAVA005","pattern":r"\bSystem\.out\.print\s*[^;\n]*\s*$","error":"Possible missing semicolon","reason":"Java statements normally end with ;.","fix":"Add ; after print()."},
 
-    (
-        r"\bboolean\s+\w+\s*=\s*\d",
-        "Type Mismatch",
-        "Number assigned to boolean.",
-        "Use true/false."
-    ),
+# 06
+{"id":"JAVA006","pattern":r"\bif\s*[^)]*(?<![=!<>])=(?!=)[^)]*","error":"Assignment in condition","reason":"= performs assignment.","fix":"Use == for comparison."},
 
-    (
-        r"\bString\s+\w+\s*=\s*\d",
-        "Type Mismatch",
-        "Number assigned to String.",
-        "Use String.valueOf() or a numeric type."
-    ),
+# 07
+{"id":"JAVA007","pattern":r"\bwhile\s*[^)]*(?<![=!<>])=(?!=)[^)]*","error":"Assignment in while condition","reason":"= performs assignment.","fix":"Use == for comparison."},
 
-    (
-        r"\bint\s+\w+\s*=\s*null\b",
-        "Null Primitive Error",
-        "Primitive int cannot contain null.",
-        "Use Integer if null is required."
-    ),
+# 08
+{"id":"JAVA008","pattern":r"\bString\s+\w+\s*==\s*","error":"String compared with ==","reason":"== compares references.","fix":"Use .equals() for String content comparison."},
 
-    (
-        r"\b\d+\s*/\s*0\b",
-        "Division By Zero",
-        "Expression divides by zero.",
-        "Check the denominator."
-    ),
+# 09
+{"id":"JAVA009","pattern":r"\bboolean\s+\w+\s*=\s*(?:0|1)\s*;","error":"Invalid boolean value","reason":"Java boolean uses true or false.","fix":"Use true or false."},
 
-    (
-        r"\bif\s*\(\s*\)",
-        "Empty If Condition",
-        "if has no condition.",
-        "Provide a condition."
-    ),
+# 10
+{"id":"JAVA010","pattern":r"\bint\s+\w+\s*=\s*\"","error":"Type mismatch","reason":"String cannot be assigned to int.","fix":"Use an integer or Integer.parseInt()."},
 
-    (
-        r"\bwhile\s*\(\s*\)",
-        "Empty While Condition",
-        "while has no condition.",
-        "Provide a condition."
-    ),
+# 11
+{"id":"JAVA011","pattern":r"\bdouble\s+\w+\s*=\s*\"","error":"Type mismatch","reason":"String cannot directly become double.","fix":"Use Double.parseDouble()."},
 
-    (
-        r"\bswitch\s*\(\s*\)",
-        "Empty Switch",
-        "switch has no expression.",
-        "Provide an expression."
-    ),
+# 12
+{"id":"JAVA012","pattern":r"\bint\s+\w+\s*=\s*\d+\.\d+\s*;","error":"Narrowing conversion","reason":"Decimal value cannot automatically become int.","fix":"Use int casting or a suitable integer value."},
 
-    (
-        r"\bcase\s*:",
-        "Missing Case Value",
-        "case requires a value.",
-        "Use case value:."
-    ),
+# 13
+{"id":"JAVA013","pattern":r"\bchar\s+\w+\s*=\s*\"[^\"']*\"\s*;","error":"Invalid char assignment","reason":"char uses single quotes.","fix":"Use char c = 'A';"},
 
-    (
-        r"\bdefault\s+;",
-        "Invalid Default",
-        "default requires ':'.",
-        "Use default:."
-    ),
+# 14
+{"id":"JAVA014","pattern":r"\bpublic\s+void\s+main\s*","error":"Invalid main method","reason":"main must be static.","fix":"Use public static void main(String[] args)."},
 
-    (
-        r"\bcatch\s*\(\s*\)",
-        "Empty Catch",
-        "catch requires an exception.",
-        "Specify exception type and variable."
-    ),
+# 15
+{"id":"JAVA015","pattern":r"\bprivate\s+static\s+void\s+main\s*\(","error":"Invalid main access","reason":"JVM expects main to be public.","fix":"Use public static void main(String[] args)."},
 
-    (
-        r"\bthrow\s*;",
-        "Invalid Throw",
-        "throw requires an exception object.",
-        "Throw a specific exception."
-    ),
+# 16
+{"id":"JAVA016","pattern":r"\bpublic\s+static\s+int\s+main\s*\(","error":"Invalid main return type","reason":"Java main normally returns void.","fix":"Use void."},
 
-    (
-        r"\bthrows\s*[\{;]",
-        "Incomplete Throws",
-        "throws requires an exception type.",
-        "Specify the exception."
-    ),
+# 17
+{"id":"JAVA017","pattern":r"\belse\s*\(","error":"Invalid else condition","reason":"else cannot directly contain a condition.","fix":"Use else if (...)."},
 
-    (
-        r"\bmain\s*\(\s*\)",
-        "Invalid Main Method",
-        "Standard Java main needs String[] args.",
-        "Use public static void main(String[] args)."
-    ),
+# 18
+{"id":"JAVA018","pattern":r"\bif\s*\([^)]*\s*;","error":"Empty if statement","reason":"The if statement has an empty body.","fix":"Remove ; or add a body.","severity":"Warning"},
 
-    (
-        r"\bclass\s+\d",
-        "Invalid Class Name",
-        "Class name cannot start with a number.",
-        "Use a valid identifier."
-    ),
+# 19
+{"id":"JAVA019","pattern":r"\bwhile\s*\s*true\s*","error":"Potential infinite loop","reason":"while(true) does not naturally terminate.","fix":"Add a valid break condition.","severity":"Warning"},
 
-    (
-        r"\b(int|double|float|long|short|byte|char|boolean|String)\s+\d",
-        "Invalid Variable Name",
-        "Variable cannot start with a number.",
-        "Use a valid identifier."
-    ),
+# 20
+{"id":"JAVA020","pattern":r"\bfor\s*\s*;\s*;\s*","error":"Infinite for loop","reason":"The loop has no condition.","fix":"Add a termination condition.","severity":"Warning"},
 
-    (
-        r"\bnew\s+\w+\s*\[\s*\]",
-        "Missing Array Size",
-        "Array creation needs a size or initializer.",
-        "Provide size or initializer."
-    ),
+# 21
+{"id":"JAVA021","pattern":r"\.length\s*\s*","error":"Possible array length error","reason":"Arrays use .length, not .length().","fix":"Use array.length."},
 
-    (
-        r"\b\w+\s*\[\s*-",
-        "Negative Array Index",
-        "Array index cannot be negative.",
-        "Use a valid index."
-    ),
+# 22
+{"id":"JAVA022","pattern":r"\.length\b","error":"Check length usage","reason":"Strings use length(), arrays use length.","fix":"Use the correct form for your data type.","severity":"Info"},
 
-    (
-        r"\.length\s*\(\s*\)",
-        "Array Length Error",
-        "Arrays use length without parentheses.",
-        "Use array.length."
-    ),
+# 23
+{"id":"JAVA023","pattern":r"\bString\s+\w+\s*=\s*null\s*;","error":"Possible NullPointerException","reason":"The String is null.","fix":"Check for null before calling methods.","severity":"Warning"},
 
-    (
-        r"\bString\s+\w+\s*==",
-        "String Comparison Error",
-        "== compares references, not String contents.",
-        "Use .equals()."
-    ),
+# 24
+{"id":"JAVA024","pattern":r"\b\w+\s*=\s*null\s*;","error":"Possible null reference","reason":"The reference may later cause NullPointerException.","fix":"Validate the object before using it.","severity":"Warning"},
 
-    (
-        r"['\"][^'\"]*['\"]\s*==\s*\w+",
-        "String Comparison Error",
-        "String contents should normally use equals().",
-        "Use .equals()."
-    ),
+# 25
+{"id":"JAVA025","pattern":r"\bnew\s+Scanner\s*","error":"Check Scanner import","reason":"Scanner requires java.util.Scanner.","fix":"Add import java.util.Scanner; if needed.","severity":"Warning"},
 
-    (
-        r"\bArrayList\s+\w+\s*=",
-        "Raw Type Warning",
-        "Raw ArrayList loses type safety.",
-        "Use ArrayList<Type>.",
-        "Warning"
-    ),
+# 26
+{"id":"JAVA026","pattern":r"\bnextInt\s*\(\s*\s*;","error":"Scanner input mismatch risk","reason":"nextInt() fails if the entered value is not an integer.","fix":"Validate input or handle InputMismatchException.","severity":"Warning"},
 
-    (
-        r"\bHashMap\s+\w+\s*=",
-        "Raw Type Warning",
-        "Raw HashMap loses generic type safety.",
-        "Use HashMap<Key,Value>.",
-        "Warning"
-    ),
+# 27
+{"id":"JAVA027","pattern":r"\bnextDouble\s*\s*\s*;","error":"Scanner input mismatch risk","reason":"nextDouble() requires numeric input.","fix":"Validate input or handle InputMismatchException.","severity":"Warning"},
 
-    (
-        r"\bScanner\s+\w+\s*=\s*new\s+Scanner\s*\(\s*\)",
-        "Scanner Constructor Error",
-        "Scanner requires an input source.",
-        "Use new Scanner(System.in)."
-    ),
+# 28
+{"id":"JAVA028","pattern":r"\bcatch\s*\s*Exception\s+\w+\s*","error":"Broad exception handling","reason":"Exception catches many unrelated problems.","fix":"Catch the specific exception.","severity":"Warning"},
 
-    (
-        r"\bpackage\s*;",
-        "Invalid Package",
-        "package requires a package name.",
-        "Specify a package or remove it."
-    ),
+# 29
+{"id":"JAVA029","pattern":r"\bcatch\s*\s*Throwable\s+\w+\s*","error":"Very broad exception handling","reason":"Throwable includes serious JVM errors.","fix":"Catch only the expected exception.","severity":"Warning"},
 
-    (
-        r"\bimport\s*;",
-        "Invalid Import",
-        "import requires a class/package.",
-        "Specify what to import."
-    ),
+# 30
+{"id":"JAVA030","pattern":r"\bthrow\s+new\s+Exception\s*","error":"Generic Exception thrown","reason":"Generic Exception provides little information.","fix":"Prefer a specific exception type.","severity":"Warning"},
 
-    (
-        r"\bextends\s*[\{;]",
-        "Incomplete Extends",
-        "extends requires a parent class.",
-        "Specify superclass."
-    ),
+# 31
+{"id":"JAVA031","pattern":r"\bString\s+\w+\s*=\s*new\s+String\s*\(","error":"Unnecessary String object","reason":"String literals are normally preferable.","fix":"Use a String literal when possible.","severity":"Warning"},
 
-    (
-        r"\bimplements\s*[\{;]",
-        "Incomplete Implements",
-        "implements requires an interface.",
-        "Specify interface."
-    ),
+# 32
+{"id":"JAVA032","pattern":r"\bInteger\.parseInt\s*\(\s*\"[^\"]*\"\s*","error":"Check integer conversion","reason":"Invalid numeric text causes NumberFormatException.","fix":"Validate the input before parsing.","severity":"Warning"},
 
-    (
-        r"\bstatic\s+static\b",
-        "Duplicate Modifier",
-        "static is repeated.",
-        "Remove duplicate modifier."
-    ),
+# 33
+{"id":"JAVA033","pattern":r"\bDouble\.parseDouble\s*\s*\"[^\"]*\"\s*","error":"Check double conversion","reason":"Invalid text causes NumberFormatException.","fix":"Validate the input.","severity":"Warning"},
 
-    (
-        r"\bpublic\s+public\b",
-        "Duplicate Modifier",
-        "public is repeated.",
-        "Remove duplicate modifier."
-    ),
+# 34
+{"id":"JAVA034","pattern":r"\bArrayIndexOutOfBoundsException\b","error":"Array index exception mentioned","reason":"An invalid array index can cause this exception.","fix":"Check that index >= 0 and index < array.length.","severity":"Warning"},
 
-    (
-        r"\bprivate\s+private\b",
-        "Duplicate Modifier",
-        "private is repeated.",
-        "Remove duplicate modifier."
-    ),
+# 35
+{"id":"JAVA035","pattern":r"\bNullPointerException\b","error":"NullPointerException mentioned","reason":"Null references can cause runtime failures.","fix":"Check objects for null before dereferencing.","severity":"Warning"},
 
-    (
-        r"\bfinal\s+final\b",
-        "Duplicate Modifier",
-        "final is repeated.",
-        "Remove duplicate modifier."
-    ),
+# 36
+{"id":"JAVA036","pattern":r"\b\d+\s*/\s*0\b","error":"Division by zero","reason":"Integer division by zero throws ArithmeticException.","fix":"Check denominator before division."},
 
-    (
-        r"\bInteger\.parseInt\s*\(\s*['\"][A-Za-z]+['\"]\s*\)",
-        "Number Format Error",
-        "Text cannot be converted to integer.",
-        "Provide numeric text or catch NumberFormatException."
-    ),
+# 37
+{"id":"JAVA037","pattern":r"\b\d+\s*%\s*0\b","error":"Modulo by zero","reason":"Modulo by zero throws ArithmeticException.","fix":"Ensure divisor is not zero."},
 
-    (
-        r"\bDouble\.parseDouble\s*\(\s*['\"][A-Za-z]+['\"]\s*\)",
-        "Number Format Error",
-        "Text may not be a valid double.",
-        "Use valid numeric text."
-    ),
+# 38
+{"id":"JAVA038","pattern":r"\bfinal\s+\w+\s+\w+\s*=\s*[^;]+;.*\b\w+\s*=","error":"Possible final variable reassignment","reason":"final variables cannot be reassigned.","fix":"Do not assign a new value to a final variable."},
 
-    (
-        r"\bSystem\.out\.println\s*\(\s*\w+\s*\+\s*\w+\s*\)",
-        "Expression Check",
-        "Check whether + is arithmetic or concatenation.",
-        "Use explicit types/parentheses if required.",
-        "Warning"
-    ),
+# 39
+{"id":"JAVA039","pattern":r"\bthis\s*\.\s*this\b","error":"Invalid this usage","reason":"this refers to the current object.","fix":"Use this.field or this.method()."},
 
-    (
-        r"\breturn\s*;\s*$",
-        "Empty Return",
-        "Non-void method may require a value.",
-        "Return the correct value."
-    ),
+# 40
+{"id":"JAVA040","pattern":r"\bsuper\s*\.\s*super\b","error":"Invalid super usage","reason":"super cannot be chained this way.","fix":"Use super.field or super.method()."},
 
-    (
-        r"\bif\s*\([^)]*\)\s*=",
-        "Assignment In Condition",
-        "A single '=' performs assignment.",
-        "Use == for comparison."
-    ),
+# 41
+{"id":"JAVA041","pattern":r"\bimplements\s+\w+\s*\{","error":"Check interface implementation","reason":"A class implementing an interface must implement required methods unless abstract.","fix":"Implement all required interface methods."},
 
-    (
-        r"\bnull\s*\+\s*\d+",
-        "Null Arithmetic",
-        "null is used in arithmetic.",
-        "Check value before arithmetic."
-    ),
+# 42
+{"id":"JAVA042","pattern":r"\bextends\s+\w+\s*,\s*\w+","error":"Multiple class inheritance","reason":"Java classes cannot extend multiple classes.","fix":"Extend one class and use interfaces for multiple inheritance of type."},
 
-    (
-        r"\bnew\s+\w+\s*\([^)]*$",
-        "Unclosed Constructor",
-        "Constructor call is not closed.",
-        "Add ')'."
-    ),
+# 43
+{"id":"JAVA043","pattern":r"\bpublic\s+class\s+\w+\s+extends\s+\w+\s+extends\b","error":"Multiple extends declarations","reason":"A Java class can extend only one class.","fix":"Remove the second extends."},
 
-    (
-        r"\bcatch\s*\(\s*\w+\s+\)",
-        "Invalid Catch Parameter",
-        "Catch parameter has no variable name.",
-        "Use catch(Exception e)."
-    ),
+# 44
+{"id":"JAVA044","pattern":r"\babstract\s+final\s+class\b","error":"Invalid abstract final class","reason":"An abstract class is intended for inheritance while final prevents inheritance.","fix":"Remove either abstract or final."},
 
-    (
-        r"\bthrow\s+\w+\s*$",
-        "Possible Missing Semicolon",
-        "throw statement appears incomplete.",
-        "Complete the statement and add ';'."
-    ),
+# 45
+{"id":"JAVA045","pattern":r"\bprivate\s+abstract\b","error":"Invalid private abstract member","reason":"Private methods cannot be overridden by subclasses.","fix":"Use an appropriate access modifier."},
 
-    (
-        r"\bfor\s*\([^)]*;[^)]*;\s*\)",
-        "For Loop Check",
-        "Verify initialization, condition and update.",
-        "Ensure loop logic is correct.",
-        "Warning"
-    ),
+# 46
+{"id":"JAVA046","pattern":r"\bstatic\s+this\b","error":"Invalid static this usage","reason":"static context does not have an instance this reference.","fix":"Use an object reference or remove static."},
 
-    (
-        r"\bwhile\s*\(\s*true\s*\)",
-        "Possible Infinite Loop",
-        "Loop is always true.",
-        "Ensure a reachable break condition.",
-        "Warning"
-    ),
+# 47
+{"id":"JAVA047","pattern":r"\bstatic\s+super\b","error":"Invalid static super usage","reason":"super is an instance reference.","fix":"Use super inside an instance context."},
 
-    (
-        r"\bdo\s*\{",
-        "Do While Check",
-        "Verify that the do block ends with while(condition);.",
-        "Add the required while condition.",
-        "Warning"
-    ),
+# 48
+{"id":"JAVA048","pattern":r"\bnew\s+\w+\s*\s*-",
+"error":"Negative array size",
+"reason":"Array size cannot be negative.",
+"fix":"Use a non-negative array size."
+},
 
-    (
-        r"\bnew\s+\w+\s*\[\s*-",
-        "Negative Array Size",
-        "Array size cannot be negative.",
-        "Use a non-negative size."
-    ),
+# 49
+{"id":"JAVA049","pattern":r"\bcase\s+[^:]+;",
+"error":"Possible invalid switch case",
+"reason":"switch case labels normally use a colon.",
+"fix":"Use case value:."
+},
 
-    (
-        r"\bSystem\.out\.println\s*\([^)]*$",
-        "Unclosed println",
-        "println call is not closed.",
-        "Add ')'."
-    ),
+# 50
+{"id":"JAVA050","pattern":r"\bdefault\s*;",
+"error":"Invalid switch default",
+"reason":"default normally requires a colon.",
+"fix":"Use default:."
+},
 
-    (
-        r"\bSystem\.out\.print\s*\([^)]*$",
-        "Unclosed print",
-        "print call is not closed.",
-        "Add ')'."
-    ),
+# 51
+{"id":"JAVA051","pattern":r"\bbreak\s*;\s*break\s*;",
+"error":"Duplicate break",
+"reason":"The second break may be unreachable or unnecessary.",
+"fix":"Check the switch/loop logic.",
+"severity":"Warning"
+},
 
-    (
-        r"\bScanner\s+\w+\s*=\s*new\s+Scanner\s*\(",
-        "Scanner Initialization Check",
-        "Verify Scanner has a valid input source.",
-        "Usually use System.in.",
-        "Warning"
-    ),
+# 52
+{"id":"JAVA052","pattern":r"\bcontinue\s*;\s*continue\s*;",
+"error":"Duplicate continue",
+"reason":"The second continue may be unreachable.",
+"fix":"Check loop logic.",
+"severity":"Warning"
+},
 
-    (
-        r"\bStringBuilder\s+\w+\s*=\s*new\s+StringBuilder\s*\(\s*\)\s*;",
-        "StringBuilder Check",
-        "Empty StringBuilder is valid; verify intended capacity.",
-        "Use a capacity if large strings are expected.",
-        "Warning"
-    )
+# 53
+{"id":"JAVA053","pattern":r"\bimport\s+java\.util\.scanner\b",
+"error":"Incorrect Scanner import",
+"reason":"Java package names are case-sensitive.",
+"fix":"Use import java.util.Scanner;"
+},
+
+# 54
+{"id":"JAVA054","pattern":r"\bSystem\.out\.Println\b",
+"error":"Incorrect println capitalization",
+"reason":"Java method names are case-sensitive.",
+"fix":"Use System.out.println()."
+},
+
+# 55
+{"id":"JAVA055","pattern":r"\bSystem\.Out\b",
+"error":"Incorrect System.out capitalization",
+"reason":"Java identifiers are case-sensitive.",
+"fix":"Use System.out."
+},
+
+# 56
+{"id":"JAVA056","pattern":r"\bString\.length\s*\(\s*",
+"error":"Invalid String length usage",
+"reason":"length() belongs to a String object, not the String class.",
+"fix":"Call text.length()."
+},
+
+# 57
+{"id":"JAVA057","pattern":r"\bString\.charAt\s*","error":"Invalid static charAt usage","reason":"charAt() is an instance method.","fix":"Use text.charAt(index)."},
+
+# 58
+{"id":"JAVA058","pattern":r"\bMath\.random\s*\(\s*\s*==\s*","error":"Random comparison check","reason":"Math.random() returns a double in the range [0,1).","fix":"Check the intended probability/range.","severity":"Warning"},
+
+# 59
+{"id":"JAVA059","pattern":r"\bpublic\s+class\s+\w+\s*\{[\s\S]*\bpublic\s+class\b","error":"Multiple public classes","reason":"A Java source file normally has at most one public top-level class.","fix":"Move additional public classes to separate files or remove public."},
+
+# 60
+{"id":"JAVA060","pattern":r"\bSystem\.out\.println\s*\s*;","error":"Empty println",
+"reason":"println() prints only a newline.",
+"fix":"Add a value if output is intended.",
+"severity":"Warning"}
 ]
 
 
 def analyze_java(code):
 
-    found = check_patterns(
-        code,
-        "java",
-        JAVA_PATTERNS
-    )
-
-    return found or success_result("java")
-
-
-# =========================================================
-# C / C++ / JAVASCRIPT
-# =========================================================
-# Add their rule lists here using the same pattern:
-#
-# (
-#   r"regex",
-#   "Error Name",
-#   "Reason",
-#   "Fix"
-# )
-#
-# The dispatcher below is already ready for them.
-# =========================================================
-
-
-def analyze_c(code):
-    # Common C errors
-    patterns = [
-
-        (
-            r"\bprintff\s*\(",
-            "Typo Error",
-            "printff is not a standard C function.",
-            "Use printf()."
-        ),
-
-        (
-            r"\bprintf\s*\([^;]*\)\s*$",
-            "Missing Semicolon",
-            "printf statement is missing ';'.",
-            "Add ';'."
-        ),
-
-        (
-            r"\bscanf\s*\([^;]*\)\s*$",
-            "Missing Semicolon",
-            "scanf statement is missing ';'.",
-            "Add ';'."
-        ),
-
-        (
-            r"\bvoid\s+main\s*\(",
-            "Non Standard Main",
-            "void main() is not standard C.",
-            "Use int main()."
-        ),
-
-        (
-            r"\b\d+\s*/\s*0\b",
-            "Division By Zero",
-            "Division by zero detected.",
-            "Use a non-zero denominator."
-        ),
-
-        (
-            r"\bchar\s+\w+\s*=\s*\"[^\"]*\"",
-            "Character Assignment Error",
-            "char cannot store a string.",
-            "Use single quotes for one character."
-        ),
-
-        (
-            r"\bint\s+\w+\s*=\s*\"[^\"]*\"",
-            "Type Mismatch",
-            "String assigned to int.",
-            "Use an integer value."
-        ),
-
-        (
-            r"\bgets\s*\(",
-            "Unsafe gets Usage",
-            "gets() can cause buffer overflow.",
-            "Use fgets().",
-            "Warning"
-        ),
-
-        (
-            r"\bstrcpy\s*\(",
-            "Unsafe strcpy Usage",
-            "strcpy() can overflow destination buffer.",
-            "Use safer bounded string handling.",
-            "Warning"
-        ),
-
-        (
-            r"\bstrcat\s*\(",
-            "Unsafe strcat Usage",
-            "strcat() can overflow destination buffer.",
-            "Ensure sufficient destination capacity.",
-            "Warning"
-        ),
-
-        (
-            r"\bscanf\s*\(\s*\"[^\"]*%d[^\"]*\"\s*,\s*(?!&)",
-            "scanf Missing Address",
-            "scanf %d normally requires an address.",
-            "Use &variable."
-        ),
-
-        (
-            r"\bscanf\s*\(\s*\"[^\"]*%f[^\"]*\"\s*,\s*(?!&)",
-            "scanf Missing Address",
-            "scanf %f normally requires a pointer.",
-            "Use &variable."
-        ),
-
-        (
-            r"\bif\s*\(\s*\)",
-            "Empty If Condition",
-            "if has no condition.",
-            "Provide a condition."
-        ),
-
-        (
-            r"\bwhile\s*\(\s*\)",
-            "Empty While Condition",
-            "while has no condition.",
-            "Provide a condition."
-        ),
-
-        (
-            r"\bfor\s*\(\s*;\s*;\s*\)",
-            "Empty For Loop",
-            "for loop has no expressions.",
-            "Add loop expressions."
-        ),
-
-        (
-            r"\bswitch\s*\(\s*\)",
-            "Empty Switch",
-            "switch has no expression.",
-            "Provide an expression."
-        ),
-
-        (
-            r"\bcase\s*:",
-            "Missing Case Value",
-            "case requires a value.",
-            "Use case value:."
-        ),
-
-        (
-            r"\bdefault\s+;",
-            "Invalid Default",
-            "default requires ':'.",
-            "Use default:."
-        ),
-
-        (
-            r"\bint\s+\w+\s*\[\s*-",
-            "Negative Array Size",
-            "Array size cannot be negative.",
-            "Use a positive size."
-        ),
-
-        (
-            r"\bint\s+\*\s*\w+\s*=\s*\d+",
-            "Pointer Type Error",
-            "Integer assigned to pointer.",
-            "Assign a valid address."
-        ),
-
-        (
-            r"\bmalloc\s*\(\s*0\s*\)",
-            "Zero Size Allocation",
-            "malloc(0) is suspicious.",
-            "Validate allocation size.",
-            "Warning"
-        ),
-
-        (
-            r"\bfree\s*\(\s*&",
-            "Invalid free",
-            "Address of a variable should not normally be passed to free().",
-            "Free the allocated pointer."
-        ),
-
-        (
-            r"\bif\s*\([^)]*\)\s*=\s*",
-            "Assignment In Condition",
-            "Single '=' performs assignment.",
-            "Use == for comparison."
-        ),
-
-        (
-            r"\bwhile\s*\(\s*1\s*\)",
-            "Possible Infinite Loop",
-            "while(1) is always true.",
-            "Ensure a reachable break.",
-            "Warning"
-        ),
-
-        (
-            r"\bvoid\s+\w+\s*\([^)]*\)\s*\{",
-            "Function Check",
-            "Void function detected.",
-            "Verify return logic.",
-            "Warning"
-        ),
-
-        (
-            r"\binclude\s*[<\"]",
-            "Invalid Include",
-            "Preprocessor include needs '#'.",
-            "Use #include <header.h>."
-        ),
-
-        (
-            r"\bsizeof\s*\(\s*\)",
-            "Empty sizeof",
-            "sizeof requires a type or expression.",
-            "Provide a type or expression."
-        ),
-
-        (
-            r"\breturn\s+\w+\s*$",
-            "Missing Semicolon",
-            "return statement appears incomplete.",
-            "Add ';'."
-        )
-    ]
-
-    found = check_patterns(code, "c", patterns)
-
-    return found or success_result("c")
-
-
-def analyze_cpp(code):
-
-    patterns = [
-
-        (
-            r"\bprintff\s*\(",
-            "Typo Error",
-            "printff is not a standard C++ function.",
-            "Use cout or printf()."
-        ),
-
-        (
-            r"\bcout\s*<<[^;]*$",
-            "Missing Semicolon",
-            "cout statement is missing ';'.",
-            "Add ';'."
-        ),
-
-        (
-            r"\bcin\s*>>[^;]*$",
-            "Missing Semicolon",
-            "cin statement is missing ';'.",
-            "Add ';'."
-        ),
-
-        (
-            r"\bcout\s*<(?!!)",
-            "Wrong Stream Operator",
-            "cout uses <<.",
-            "Use cout << value;"
-        ),
-
-        (
-            r"\bcin\s*<(?!!)",
-            "Wrong Input Operator",
-            "cin uses >>.",
-            "Use cin >> value;"
-        ),
-
-        (
-            r"\bint\s+\w+\s*=\s*\"[^\"]*\"",
-            "Type Mismatch",
-            "String assigned to int.",
-            "Use a numeric value."
-        ),
-
-        (
-            r"\bchar\s+\w+\s*=\s*\"[^\"]*\"",
-            "Character Assignment Error",
-            "char cannot store a string.",
-            "Use a character literal."
-        ),
-
-        (
-            r"\b\d+\s*/\s*0\b",
-            "Division By Zero",
-            "Division by zero detected.",
-            "Check denominator."
-        ),
-
-        (
-            r"\bif\s*\(\s*\)",
-            "Empty If Condition",
-            "if has no condition.",
-            "Provide a condition."
-        ),
-
-        (
-            r"\bwhile\s*\(\s*\)",
-            "Empty While Condition",
-            "while has no condition.",
-            "Provide a condition."
-        ),
-
-        (
-            r"\bfor\s*\(\s*;\s*;\s*\)",
-            "Empty For Loop",
-            "for loop has no expressions.",
-            "Add loop expressions."
-        ),
-
-        (
-            r"\bswitch\s*\(\s*\)",
-            "Empty Switch",
-            "switch has no expression.",
-            "Provide expression."
-        ),
-
-        (
-            r"\bcase\s*:",
-            "Missing Case Value",
-            "case requires a value.",
-            "Use case value:."
-        ),
-
-        (
-            r"\bdefault\s+;",
-            "Invalid Default",
-            "default requires ':'.",
-            "Use default:."
-        ),
-
-        (
-            r"\bdelete\s*\(",
-            "Invalid Delete Syntax",
-            "delete is an operator.",
-            "Use delete pointer;"
-        ),
-
-        (
-            r"\bfree\s*\(\s*new\s+",
-            "Mixed Memory APIs",
-            "new memory should not be released with free().",
-            "Use delete/delete[]."
-        ),
-
-        (
-            r"\bnew\s+\w+\s*\[\s*0\s*\]",
-            "Zero Size Allocation",
-            "Zero-size array allocation is suspicious.",
-            "Use a positive size.",
-            "Warning"
-        ),
-
-        (
-            r"\bNULL\b",
-            "Legacy Null Pointer",
-            "NULL is legacy in modern C++.",
-            "Prefer nullptr.",
-            "Warning"
-        ),
-
-        (
-            r"\bclass\s+\d",
-            "Invalid Class Name",
-            "Class name cannot start with a number.",
-            "Use a valid identifier."
-        ),
-
-        (
-            r"\bauto\s+\w+\s*;",
-            "Undeduced Auto",
-            "auto needs an initializer.",
-            "Initialize the variable."
-        ),
-
-        (
-            r"\bstd::string\s+\w+\s*=\s*'[^']*'",
-            "String Literal Error",
-            "Single quotes create character literals.",
-            "Use double quotes for std::string."
-        ),
-
-        (
-            r"\bstrcmp\s*\([^)]*\)\s*==\s*1",
-            "strcmp Logic Error",
-            "strcmp is not guaranteed to return exactly 1.",
-            "Compare > 0, == 0 or < 0."
-        ),
-
-        (
-            r"\bstrcmp\s*\([^)]*\)\s*==\s*-1",
-            "strcmp Logic Error",
-            "strcmp is not guaranteed to return exactly -1.",
-            "Compare < 0."
-        ),
-
-        (
-            r"\bif\s*\([^)]*\)\s*=\s*",
-            "Assignment In Condition",
-            "Single '=' performs assignment.",
-            "Use == for comparison."
-        ),
-
-        (
-            r"\bwhile\s*\(\s*true\s*\)",
-            "Possible Infinite Loop",
-            "while(true) never ends without an exit.",
-            "Ensure a break/return.",
-            "Warning"
-        ),
-
-        (
-            r"\bvoid\s+main\s*\(",
-            "Non Standard Main",
-            "void main() is not standard C++.",
-            "Use int main()."
-        ),
-
-        (
-            r"\bnew\s+\w+\s*;\s*$",
-            "Unassigned Allocation",
-            "Allocated object is not stored.",
-            "Store the pointer or use a smart pointer."
-        ),
-
-        (
-            r"\bvector\s*<\s*\w+\s*>\s+\w+\s*\[\s*-",
-            "Negative Index",
-            "Vector index cannot be negative.",
-            "Use a valid index."
-        )
-    ]
-
-    found = check_patterns(code, "cpp", patterns)
-
-    return found or success_result("cpp")
-
-
-def analyze_javascript(code):
-
-    patterns = [
-
-        (
-            r"\bprintff\s*\(",
-            "Typo Error",
-            "printff is not a JavaScript function.",
-            "Use console.log()."
-        ),
-
-        (
-            r"\bprintf\s*\(",
-            "Unknown Function",
-            "printf is not standard browser JavaScript.",
-            "Use console.log()."
-        ),
-
-        (
-            r"\bconsole\.log\s*\([^)]*$",
-            "Unclosed console.log",
-            "console.log() is not closed.",
-            "Add ')'."
-        ),
-
-        (
-            r"\bif\s*\(\s*\)",
-            "Empty If Condition",
-            "if has no condition.",
-            "Provide a condition."
-        ),
-
-        (
-            r"\bwhile\s*\(\s*\)",
-            "Empty While Condition",
-            "while has no condition.",
-            "Provide a condition."
-        ),
-
-        (
-            r"\bfor\s*\(\s*;\s*;\s*\)",
-            "Empty For Loop",
-            "for loop has no expressions.",
-            "Add loop expressions."
-        ),
-
-        (
-            r"\bfunction\s+\d",
-            "Invalid Function Name",
-            "Function name cannot start with a number.",
-            "Use a valid identifier."
-        ),
-
-        (
-            r"\b(let|const|var)\s+\d",
-            "Invalid Variable Name",
-            "Variable cannot start with a number.",
-            "Use a valid identifier."
-        ),
-
-        (
-            r"\bconst\s+\w+\s*=\s*$",
-            "Uninitialized Const",
-            "const must have a value.",
-            "Initialize the const."
-        ),
-
-        (
-            r"\btrue\s*=",
-            "Invalid Assignment",
-            "true is a Boolean literal.",
-            "Assign to a variable instead."
-        ),
-
-        (
-            r"\bfalse\s*=",
-            "Invalid Assignment",
-            "false is a Boolean literal.",
-            "Assign to a variable instead."
-        ),
-
-        (
-            r"\bundefined\s*=",
-            "Invalid Assignment",
-            "undefined should not be assigned directly.",
-            "Use a variable."
-        ),
-
-        (
-            r"\bNaN\s*=",
-            "Invalid Assignment",
-            "NaN is a special numeric value.",
-            "Do not assign to NaN."
-        ),
-
-        (
-            r"\btypeof\s+\w+\s*==\s*['\"]object['\"]",
-            "Null Type Check Issue",
-            "typeof null returns object.",
-            "Check value !== null.",
-            "Warning"
-        ),
-
-        (
-            r"\b\d+\s*/\s*0\b",
-            "Division By Zero",
-            "JavaScript produces Infinity for division by zero.",
-            "Validate denominator.",
-            "Warning"
-        ),
-
-        (
-            r"\bJSON\.parse\s*\(\s*\)",
-            "Missing JSON Input",
-            "JSON.parse requires input.",
-            "Provide JSON text."
-        ),
-
-        (
-            r"\bdocument\.getElementById\s*\(\s*\)",
-            "Missing Element ID",
-            "getElementById requires an ID.",
-            "Provide an element ID."
-        ),
-
-        (
-            r"\bdocument\.querySelector\s*\(\s*\)",
-            "Missing Selector",
-            "querySelector requires a CSS selector.",
-            "Provide a selector."
-        ),
-
-        (
-            r"\bdocument\.querySelectorAll\s*\(\s*\)",
-            "Missing Selector",
-            "querySelectorAll requires a selector.",
-            "Provide a selector."
-        ),
-
-        (
-            r"\baddEventListener\s*\(\s*['\"][^'\"]*['\"]\s*,\s*\)",
-            "Missing Event Handler",
-            "addEventListener needs a callback.",
-            "Provide a function."
-        ),
-
-        (
-            r"\bsetTimeout\s*\(\s*\)",
-            "Incomplete setTimeout",
-            "setTimeout needs a callback.",
-            "Provide a callback."
-        ),
-
-        (
-            r"\bsetInterval\s*\(\s*\)",
-            "Incomplete setInterval",
-            "setInterval needs a callback.",
-            "Provide a callback."
-        ),
-
-        (
-            r"\bparseInt\s*\(\s*['\"][A-Za-z]+['\"]",
-            "Possible NaN",
-            "parseInt may return NaN.",
-            "Validate the input."
-        ),
-
-        (
-            r"\bparseFloat\s*\(\s*['\"][A-Za-z]+['\"]",
-            "Possible NaN",
-            "parseFloat may return NaN.",
-            "Validate the input."
-        ),
-
-        (
-            r"\.length\s*\(\s*\)",
-            "Invalid length Usage",
-            "JavaScript length is a property.",
-            "Use value.length."
-        ),
-
-        (
-            r"\bfor\s*\(\s*let\s+\w+\s*=\s*0\s*;\s*\w+\s*<=\s*\w+\.length\s*;",
-            "Possible Array Out Of Bounds",
-            "Index may reach array.length.",
-            "Use < array.length."
-        ),
-
-        (
-            r"\bif\s*\([^)]*\)\s*=\s*[^=]",
-            "Assignment Instead Of Comparison",
-            "Single '=' assigns a value.",
-            "Use === or ==."
-        ),
-
-        (
-            r"\bvar\s+",
-            "Legacy var Usage",
-            "var has function scope.",
-            "Prefer let or const.",
-            "Warning"
-        ),
-
-        (
-            r"\beval\s*\(",
-            "Dangerous eval Usage",
-            "eval executes dynamic JavaScript.",
-            "Avoid eval for untrusted input.",
-            "Warning"
-        ),
-
-        (
-            r"\bdocument\.write\s*\(",
-            "Dangerous document.write",
-            "document.write can overwrite the page.",
-            "Prefer DOM methods.",
-            "Warning"
-        ),
-
-        (
-            r"\binnerHTML\s*=",
-            "Potential XSS Sink",
-            "Untrusted HTML can cause XSS.",
-            "Prefer textContent or sanitize HTML.",
-            "Warning"
-        ),
-
-        (
-            r"\bfetch\s*\(\s*\)",
-            "Missing Fetch URL",
-            "fetch requires a URL.",
-            "Provide an endpoint."
-        ),
-
-        (
-            r"\bawait\s*$",
-            "Incomplete Await",
-            "await requires an expression.",
-            "Await a Promise."
-        ),
-
-        (
-            r"\bthrow\s*;",
-            "Incomplete Throw",
-            "throw requires an expression.",
-            "Throw an Error."
-        ),
-
-        (
-            r"\bnew\s+Error\s*\(\s*\)",
-            "Empty Error Message",
-            "Error has no message.",
-            "Provide an error message.",
-            "Warning"
-        ),
-
-        (
-            r"\btry\s*\{[^}]*\}\s*(?!catch|finally)",
-            "Missing Catch/Finally",
-            "try needs catch or finally.",
-            "Add catch or finally."
-        ),
-
-        (
-            r"\bswitch\s*\(\s*\)",
-            "Empty Switch",
-            "switch has no expression.",
-            "Provide an expression."
-        ),
-
-        (
-            r"\bcase\s*:",
-            "Missing Case Value",
-            "case requires a value.",
-            "Use case value:."
-        ),
-
-        (
-            r"\breturn\s+[^;{}\n]+$",
-            "Missing Semicolon",
-            "return statement may need ';'.",
-            "Add ';'.",
-            "Warning"
-        ),
-
-        (
-            r"\b(let|const|var)\s+\w+\s*=\s*[^;{}\n]+$",
-            "Possible Missing Semicolon",
-            "Variable declaration may be missing ';'.",
-            "Add ';'.",
-            "Warning"
-        ),
-
-        (
-            r"\bArray\s*\(\s*-",
-            "Invalid Array Size",
-            "Array length cannot be negative.",
-            "Use a non-negative size."
-        ),
-
-        (
-            r"\bnew\s+Date\s*\(\s*['\"]invalid['\"]",
-            "Invalid Date",
-            "Invalid date string detected.",
-            "Use a valid date."
-        ),
-
-        (
-            r"\bPromise\.resolve\s*\(\s*\)",
-            "Undefined Promise Value",
-            "Promise resolves with undefined.",
-            "Provide the intended value.",
-            "Warning"
-        ),
-
-        (
-            r"\bcatch\s*\(\s*\)",
-            "Catch Parameter Check",
-            "Catch parameter is omitted.",
-            "Use catch(error) if the error object is needed.",
-            "Warning"
-        )
-    ]
-
-    found = check_patterns(
-        code,
-        "javascript",
-        patterns
-    )
-
-    return found or success_result("javascript")
-
-
-# =========================================================
-# LANGUAGE DISPATCHER
-# =========================================================
-
-ALIASES = {
-
-    "py": "python",
-    "python3": "python",
-
-    "js": "javascript",
-    "node": "javascript",
-
-    "c++": "cpp",
-    "cc": "cpp",
-
-    "java": "java",
-    "c": "c"
-}
-
-
-def analyze(code, language):
-
-    language = language.lower().strip()
-
-    language = ALIASES.get(
-        language,
-        language
-    )
-
-    if not code.strip():
-
-        return error_result(
-            language,
-            "Empty Code",
-            "No code was provided.",
-            "Enter some code."
+    errors = regex_scan(code, "Java", JAVA_RULES)
+
+    # Basic brace balance
+    if code.count("{") != code.count("}"):
+
+        errors.append(
+            result(
+                "Java",
+                "Unbalanced curly braces",
+                "Opening and closing braces do not match.",
+                "Check { and } in the code.",
+                None,
+                "Error",
+                "JAVA-BRACES"
+            )
         )
 
-    if language == "python":
-        return analyze_python(code)
+    if code.count("(") != code.count(")"):
 
-    if language == "java":
-        return analyze_java(code)
-
-    if language == "c":
-        return analyze_c(code)
-
-    if language == "cpp":
-        return analyze_cpp(code)
-
-    if language == "javascript":
-        return analyze_javascript(code)
-
-    return error_result(
-        language,
-        "Unsupported Language",
-        "This language is not configured.",
-        "Select Python, Java, C, C++ or JavaScript."
-    )
-
-
-# =========================================================
-# API
-# =========================================================
-
-@app.route("/analyze", methods=["POST"])
-def analyze_route():
-
-    try:
-
-        data = request.get_json(silent=True) or {}
-
-        code = data.get("code", "")
-        language = data.get(
-            "language",
-            "python"
+        errors.append(
+            result(
+                "Java",
+                "Unbalanced parentheses",
+                "Opening and closing parentheses do not match.",
+                "Check ( and ) in the code.",
+                None,
+                "Error",
+                "JAVA-PAREN"
+            )
         )
 
-        return jsonify(
-            analyze(code, language)
+    if code.count("[") != code.count("]"):
+
+        errors.append(
+            result(
+                "Java",
+                "Unbalanced square brackets",
+                "Opening and closing square brackets do not match.",
+                "Check [ and ].",
+                None,
+                "Error",
+                "JAVA-BRACKET"
+            )
         )
 
-    except Exception as e:
-
-        return jsonify({
-
-            "status": "server_error",
-
-            "error": "Analyzer Error",
-
-            "reason": str(e),
-
-            "fix": "Check the submitted code."
-
-        }), 500
+    return remove_duplicates(errors)
 
 
-if __name__ == "__main__":
-    app.run(debug=True)
+# ============================================================
+# C
+# ============================================================
+
+C_RULES = [
+
+# 01
+{"id":"C001","pattern":r"\bprintff\s*","error":"Unknown function printff()","reason":"printff() is not a standard C function.","fix":"Use printf()."},
+
+# 02
+{"id":"C002","pattern":r"\bscanf\s*\([^;]*\s*$","error":"Possible missing semicolon","reason":"C statements normally end with ;.","fix":"Add ; after scanf()."},
+
+# 03
+{"id":"C003","pattern":r"\bprintf\s*[^;]*\s*$","error":"Possible missing semicolon","reason":"C statements normally end with ;.","fix":"Add ; after printf()."},
+
+# 04
+{"id":"C004","pattern":r"\bif\s*[^)]*(?<![=!<>])=(?!=)[^)]*","error":"Assignment inside if","reason":"= assigns a value.","fix":"Use == for comparison."},
+
+# 05
+{"id":"C005","pattern":r"\bwhile\s*[^)]*(?<![=!<>])=(?!=)[^)]*","error":"Assignment inside while","reason":"= performs assignment.","fix":"Use == for comparison."},
+
+# 06
+{"id":"C006","pattern":r"\bint\s+\w+\s*=\s*\"","error":"Type mismatch","reason":"A string literal cannot be assigned to int.","fix":"Use an integer value."},
+
+# 07
+{"id":"C007","pattern":r"\bfloat\s+\w+\s*=\s*\"","error":"Type mismatch","reason":"A string literal cannot be assigned to float.","fix":"Use a numeric value."},
+
+# 08
+{"id":"C008","pattern":r"\bdouble\s+\w+\s*=\s*\"","error":"Type mismatch","reason":"A string literal cannot be assigned to double.","fix":"Use a numeric value."},
+
+# 09
+{"id":"C009","pattern":r"\bchar\s+\w+\s*=\s*\"[^\"']*\"\s*;","error":"Possible char/string mismatch","reason":"A char normally contains one character.","fix":"Use single quotes, for example char c = 'A';"},
+
+# 10
+{"id":"C010","pattern":r"\bvoid\s+main\s*","error":"Non-standard main declaration","reason":"void main() is not the standard C main signature.","fix":"Use int main()."},
+
+# 11
+{"id":"C011","pattern":r"\bmain\s*\(\s*void\s*\s*\{","error":"Check main return type","reason":"Standard C programs normally use int main().","fix":"Use int main(void).","severity":"Warning"},
+
+# 12
+{"id":"C012","pattern":r"\bprintf\s*\s*\"[^\"]*\"\s*","error":"Check printf statement","reason":"Verify that the printf statement is terminated correctly.","fix":"Add ; if missing.","severity":"Info"},
+
+# 13
+{"id":"C013","pattern":r"\bscanf\s*\s*\"[^\"]*\"\s*,\s*\w+\s*","error":"Possible scanf address error","reason":"scanf usually requires an address for ordinary variables.","fix":"Use &variable for int, float, etc., where appropriate.","severity":"Warning"},
+
+# 14
+{"id":"C014","pattern":r"\bscanf\s*[^&]*,\s*\w+\s*","error":"Possible missing & in scanf","reason":"scanf generally needs the address of the variable.","fix":"Use &variable for scalar input."},
+
+# 15
+{"id":"C015","pattern":r"\bprintf\s*\(\s*\"%d\"\s*,\s*[A-Za-z_]\w
